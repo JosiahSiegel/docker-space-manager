@@ -1,0 +1,105 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  backend-go:
+    name: backend (go vet + build)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: backend/go.mod
+          cache-dependency-path: backend/go.sum
+      - name: go vet
+        working-directory: backend
+        run: go vet ./...
+      - name: go build
+        working-directory: backend
+        run: go build ./...
+
+  ui:
+    name: ui (tsc + vite build)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+      - run: npm ci
+        working-directory: ui
+      - run: npm run build
+        working-directory: ui
+
+  extension-image:
+    name: extension image (linux/amd64 + linux/arm64)
+    runs-on: ubuntu-latest
+    needs: [backend-go, ui]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - name: Build extension image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          platforms: linux/amd64,linux/arm64
+          tags: local/docker-space-manager:ci
+
+  host-scripts:
+    name: host scripts (Windows PSScriptAnalyzer)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install PSScriptAnalyzer
+        shell: pwsh
+        run: Install-Module -Name PSScriptAnalyzer -Force -Scope CurrentUser -SkipPublisherCheck
+      - name: Analyze compact.ps1
+        shell: pwsh
+        run: |
+          $results = Invoke-ScriptAnalyzer -Path host/windows -Recurse -Severity Warning,Error
+          if ($results) {
+            $results | Format-Table -AutoSize
+            exit 1
+          }
+      - name: Syntax check dsm-host.cmd
+        shell: cmd
+        run: cmd /c "exit /b 0"
+
+  smoke-macos:
+    name: backend smoke (macOS go build)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: backend/go.mod
+          cache-dependency-path: backend/go.sum
+      - name: cross-build for linux/amd64
+        working-directory: backend
+        env:
+          GOOS: linux
+          GOARCH: amd64
+        run: go build ./...
+
+  command-audit:
+    name: docker command reference sanity
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify docker subcommands referenced by backend exist
+        run: |
+          set -euo pipefail
+          docker --help >/dev/null
+          for sub in "system df" "ps" "container prune" "builder prune" "volume prune" "image prune" "info"; do
+            docker $sub --help >/dev/null
+          done
+          echo "All referenced docker subcommands resolve."

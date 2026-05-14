@@ -1,0 +1,26 @@
+{
+  "icon": "docker.svg",
+  "vm": {
+    "composefile": "docker-compose.yaml",
+    "exposes": {
+      "socket": "backend.sock"
+    }
+  },
+  "host": {
+    "binaries": [
+      {
+        "windows": [
+          { "path": "/host/windows/dsm-host.cmd" },
+          { "path": "/host/windows/compact.ps1" }
+        ]
+      }
+    ]
+  },
+  "ui": {
+    "dashboard-tab": {
+      "title": "Space Manager",
+      "src": "index.html",
+      "root": "ui"
+    }
+  }
+}

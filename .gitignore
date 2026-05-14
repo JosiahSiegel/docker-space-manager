@@ -1,0 +1,10 @@
+node_modules
+ui/build
+ui/dist
+*.tsbuildinfo
+backend/bin
+*.log
+.DS_Store
+.idea
+.vscode
+.claude
