@@ -121,6 +121,50 @@ function Test-Admin {
     return $p.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 }
 
+function Resolve-DockerDesktopExe {
+    # Probe live process, registry, PATH, then default install dirs. The
+    # ProgramFiles fallback is last because users with custom install paths or
+    # non-C: drive installs would otherwise be told to restart manually.
+    try {
+        $proc = Get-Process -Name 'Docker Desktop' -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($proc -and $proc.Path -and (Test-Path -LiteralPath $proc.Path)) { return $proc.Path }
+    } catch { }
+
+    foreach ($key in 'HKLM:\SOFTWARE\Docker Inc.\Docker\1.0', 'HKCU:\SOFTWARE\Docker Inc.\Docker\1.0') {
+        try {
+            $appPath = (Get-ItemProperty -Path $key -Name 'AppPath' -ErrorAction Stop).AppPath
+            if ($appPath) {
+                $exe = Join-Path $appPath 'Docker Desktop.exe'
+                if (Test-Path -LiteralPath $exe) { return $exe }
+            }
+        } catch { }
+    }
+
+    foreach ($key in 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Docker Desktop',
+                     'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\Docker Desktop') {
+        try {
+            $installLoc = (Get-ItemProperty -Path $key -Name 'InstallLocation' -ErrorAction Stop).InstallLocation
+            if ($installLoc) {
+                $exe = Join-Path $installLoc 'Docker Desktop.exe'
+                if (Test-Path -LiteralPath $exe) { return $exe }
+            }
+        } catch { }
+    }
+
+    try {
+        $cmd = Get-Command 'Docker Desktop.exe' -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($cmd -and $cmd.Source -and (Test-Path -LiteralPath $cmd.Source)) { return $cmd.Source }
+    } catch { }
+
+    foreach ($p in @(
+        (Join-Path $env:ProgramFiles 'Docker\Docker\Docker Desktop.exe'),
+        (Join-Path ${env:ProgramFiles(x86)} 'Docker\Docker\Docker Desktop.exe')
+    )) {
+        if ($p -and (Test-Path -LiteralPath $p)) { return $p }
+    }
+    return $null
+}
+
 if ($Mode -eq 'Status') {
     $vhdx = Get-VhdxStatus
     $payload = [pscustomobject]@{
@@ -155,23 +199,45 @@ try {
 
 try {
 Write-Host '==> Stopping Docker Desktop and WSL'
-# Try the documented graceful path first: `Docker Desktop.exe -Quit` triggers an
-# orderly engine + tray shutdown. Fall back to Stop-Process only if processes
-# linger past the grace window, so we don't slam containers mid-flush unnecessarily.
+# Graceful shutdown order, fall-through on failure:
+#   1. `docker desktop stop` (Docker Desktop 4.37+ CLI; reliable when present)
+#   2. `Docker Desktop.exe -Quit` (older releases)
+#   3. Stop-Process after the grace window, so we never slam containers mid-flush
+#      unless the orderly paths actually fail.
 $dockerProcs = @('Docker Desktop', 'com.docker.backend', 'com.docker.service', 'com.docker.dev-envs', 'Docker.Desktop.Service')
 
-$dockerDesktopExe = @(
-    (Join-Path $env:ProgramFiles 'Docker\Docker\Docker Desktop.exe'),
-    (Join-Path ${env:ProgramFiles(x86)} 'Docker\Docker\Docker Desktop.exe')
-) | Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1
+$dockerDesktopExe = Resolve-DockerDesktopExe
+Write-DsmLog "resolved dockerDesktopExe=$dockerDesktopExe"
 
-if ($dockerDesktopExe) {
-    Write-Host "  graceful: $dockerDesktopExe -Quit"
+$gracefulIssued = $false
+if (Get-Command docker -ErrorAction SilentlyContinue) {
+    Write-Host '  graceful: docker desktop stop'
+    try {
+        & docker desktop stop 2>&1 | Out-Null
+        if ($LASTEXITCODE -eq 0) {
+            $gracefulIssued = $true
+            Write-DsmLog 'graceful: docker desktop stop returned 0'
+        } else {
+            Write-DsmLog "graceful: docker desktop stop exit=$LASTEXITCODE"
+        }
+    } catch {
+        Write-DsmLog "graceful: docker desktop stop threw $($_.Exception.Message)"
+    }
+}
+
+if (-not $gracefulIssued -and $dockerDesktopExe) {
+    Write-Host "  graceful: `"$dockerDesktopExe`" -Quit"
     try {
         Start-Process -FilePath $dockerDesktopExe -ArgumentList '-Quit' -ErrorAction Stop | Out-Null
+        $gracefulIssued = $true
     } catch {
         Write-Host "  graceful quit failed: $($_.Exception.Message)"
+        Write-DsmLog "graceful: -Quit threw $($_.Exception.Message)"
     }
+}
+
+if (-not $gracefulIssued) {
+    Write-Host '  no graceful shutdown path available; will rely on force-stop'
 }
 
 $gracefulDeadline = (Get-Date).AddSeconds(20)
