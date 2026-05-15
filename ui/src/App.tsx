@@ -439,9 +439,9 @@ export function App() {
     const dayElapsed = Date.now() - lastAt > ONE_DAY_MS;
     if (!sessionChanged && !dayElapsed) return;
 
-    const message = `${fmtBytes(compactable.bytes)} can likely be reclaimed. Open Docker Desktop → Extensions → Docker Space Manager and click Compact.`;
+    const message = `${fmtBytes(compactable.bytes)} can likely be reclaimed. Open Docker Desktop → Extensions → Space Manager and click Compact.`;
     if (typeof Notification !== 'undefined' && Notification.permission === 'granted') {
-      const notification = new Notification('Docker Space Manager', { body: message });
+      const notification = new Notification('Space Manager', { body: message });
       compactNotificationsRef.current.push(notification);
       notification.onclick = () => {
         openExtensionFromNotification();

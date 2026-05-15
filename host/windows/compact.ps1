@@ -238,7 +238,7 @@ try {
             exit 1
         }
     } else {
-        Write-Host "ERROR: Another Docker Space Manager compaction is already running (lock at $lockPath). If this is wrong, close any other compaction window and delete that file." -ForegroundColor Red
+        Write-Host "ERROR: Another Space Manager compaction is already running (lock at $lockPath). If this is wrong, close any other compaction window and delete that file." -ForegroundColor Red
         Wait-ForExit
         exit 1
     }

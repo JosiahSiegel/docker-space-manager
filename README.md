@@ -1,4 +1,4 @@
-# Docker Space Manager
+# Space Manager
 
 A Docker Desktop extension focused on **virtual disk** bloat. The official Disk usage extension already cleans up data inside Docker; this extension targets the gap where Docker Desktop's WSL2 `.vhdx` files keep growing even after Docker reclaims internal space.
 
