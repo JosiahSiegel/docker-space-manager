@@ -460,7 +460,7 @@ export function App() {
   return (
     <Box sx={{ py: 1 }}>
       <Stack direction="row" alignItems="center" justifyContent="space-between" sx={{ mb: 2 }}>
-        <Typography variant="h6">Virtual Disk Reclaimer</Typography>
+        <Typography variant="h6">Space Manager</Typography>
         <Button size="small" onClick={() => { refreshHostStatus(); refreshUsage(); refreshContainers(); }}>Refresh</Button>
       </Stack>
 
