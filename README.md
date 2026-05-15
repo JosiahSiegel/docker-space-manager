@@ -6,7 +6,7 @@ A Docker Desktop extension focused on **virtual disk** bloat. The official Disk 
 
 - **Virtual disk report** — finds every Docker Desktop WSL2 VHDX under `%LOCALAPPDATA%\Docker\wsl`, shows on-disk size, flags the largest.
 - **One-click compaction (Windows / WSL2)** — UAC handoff: stops Docker Desktop and WSL, runs `diskpart compact vdisk` per VHDX, writes a result file with reclaimed bytes per disk.
-- **Prepare reclaim** — guarded one-click prep that frees blocks inside the engine so compaction has more to reclaim (prunes, build cache clear, `fstrim`). Treated explicitly as supporting steps to the virtual disk workflow.
+- **Prepare reclaim** — guarded one-click prep that frees blocks inside the engine so compaction has more to reclaim (stopped containers, unused images, build cache, `fstrim`). Treated explicitly as supporting steps to the virtual disk workflow.
 - **Docker usage context** — `docker system df` breakdown shown as supporting context, not the main surface.
 - **Container hotspots** — optional: pick a running container, scan common cache/temp directories with `du -sb` (falls back to `du -sk` for stripped-down images).
 

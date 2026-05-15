@@ -296,7 +296,9 @@ if ($stopResult -eq 'ok') { $gracefulIssued = $true }
 if (-not $gracefulIssued -and $dockerDesktopExe) {
     Write-Host "  graceful: `"$dockerDesktopExe`" -Quit"
     try {
-        Start-Process -FilePath $dockerDesktopExe -ArgumentList '-Quit' -ErrorAction Stop | Out-Null
+        $quitOut = Join-Path $env:TEMP 'dsm-docker-quit.out.log'
+        $quitErr = Join-Path $env:TEMP 'dsm-docker-quit.err.log'
+        Start-Process -FilePath $dockerDesktopExe -ArgumentList '-Quit' -RedirectStandardOutput $quitOut -RedirectStandardError $quitErr -ErrorAction Stop | Out-Null
         $gracefulIssued = $true
     } catch {
         Write-Host "  graceful quit failed: $($_.Exception.Message)"
@@ -359,8 +361,10 @@ foreach ($a in $after) {
 if ($dockerDesktopExe) {
     Write-Host '==> Done. Restarting Docker Desktop...'
     try {
-        Start-Process -FilePath $dockerDesktopExe -ErrorAction Stop | Out-Null
-        Write-DsmLog "restart: launched $dockerDesktopExe"
+        $restartOut = Join-Path $env:TEMP 'dsm-docker-restart.out.log'
+        $restartErr = Join-Path $env:TEMP 'dsm-docker-restart.err.log'
+        Start-Process -FilePath $dockerDesktopExe -RedirectStandardOutput $restartOut -RedirectStandardError $restartErr -ErrorAction Stop | Out-Null
+        Write-DsmLog "restart: launched $dockerDesktopExe out=$restartOut err=$restartErr"
     } catch {
         Write-DsmLog "restart: failed $($_.Exception.Message)"
         Write-Host "==> Done. Restart Docker Desktop manually: $dockerDesktopExe"

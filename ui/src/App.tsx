@@ -86,6 +86,9 @@ const COMPACT_NOTIFY_ENABLED_KEY = 'dsm.compactNotifyEnabled';
 const COMPACT_NOTIFY_THRESHOLD_GB_KEY = 'dsm.compactNotifyThresholdGb';
 const COMPACT_NOTIFY_LAST_AT_KEY = 'dsm.compactNotifyLastAt';
 const COMPACT_NOTIFY_LAST_SESSION_KEY = 'dsm.compactNotifyLastSession';
+const HOST_STATUS_CACHE_KEY = 'dsm.hostStatusCache';
+const USAGE_CACHE_KEY = 'dsm.usageCache';
+const PLATFORM_CACHE_KEY = 'dsm.platformCache';
 const DEFAULT_COMPACT_NOTIFY_THRESHOLD_GB = 20;
 const ONE_DAY_MS = 24 * 60 * 60 * 1000;
 
@@ -151,6 +154,36 @@ function compactableSourceLabel(source: CompactableSource): string {
   return 'Unavailable until Windows can read VHDX minimum size or Docker can report engine filesystem usage.';
 }
 
+function readCachedHostStatus(): HostStatus | null {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(HOST_STATUS_CACHE_KEY) ?? 'null');
+    if (!parsed || !Array.isArray(parsed.vhdx)) return null;
+    return parsed as HostStatus;
+  } catch {
+    return null;
+  }
+}
+
+function readCachedUsage(): UsageResponse | null {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(USAGE_CACHE_KEY) ?? 'null');
+    if (!parsed || !Array.isArray(parsed.summary)) return null;
+    return parsed as UsageResponse;
+  } catch {
+    return null;
+  }
+}
+
+function readCachedPlatform(): Platform | null {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(PLATFORM_CACHE_KEY) ?? 'null');
+    if (!parsed || typeof parsed.isDockerDesktop !== 'boolean') return null;
+    return parsed as Platform;
+  } catch {
+    return null;
+  }
+}
+
 function parseCompactResult(out: string): CompactResultRow[] | null {
   const trimmed = out.trim();
   if (!trimmed) return null;
@@ -173,7 +206,8 @@ function parseCompactResult(out: string): CompactResultRow[] | null {
 export function App() {
   const dd = useDD();
   const [tab, setTab] = React.useState(0);
-  const [usage, setUsage] = React.useState<UsageResponse | null>(null);
+  const [usage, setUsage] = React.useState<UsageResponse | null>(() => readCachedUsage());
+  const [usageCached, setUsageCached] = React.useState(() => readCachedUsage() !== null);
   const [usageErr, setUsageErr] = React.useState<string | null>(null);
   const [usageLoading, setUsageLoading] = React.useState(false);
   const [containers, setContainers] = React.useState<ContainerRow[]>([]);
@@ -182,9 +216,10 @@ export function App() {
   const [hotspots, setHotspots] = React.useState<Hotspot[] | null>(null);
   const [hotspotsErr, setHotspotsErr] = React.useState<string | null>(null);
   const [hotspotsLoading, setHotspotsLoading] = React.useState(false);
-  const [hostStatus, setHostStatus] = React.useState<HostStatus | null>(null);
+  const [hostStatus, setHostStatus] = React.useState<HostStatus | null>(() => readCachedHostStatus());
+  const [hostStatusCached, setHostStatusCached] = React.useState(() => readCachedHostStatus() !== null);
   const [hostErr, setHostErr] = React.useState<string | null>(null);
-  const [platform, setPlatform] = React.useState<Platform | null>(null);
+  const [platform, setPlatform] = React.useState<Platform | null>(() => readCachedPlatform());
   const [running, setRunning] = React.useState<string | null>(null);
   const [pendingAction, setPendingAction] = React.useState<PendingAction | null>(null);
   const [confirming, setConfirming] = React.useState(false);
@@ -205,7 +240,10 @@ export function App() {
     setUsageLoading(true);
     setUsageErr(null);
     try {
-      setUsage((await dd.extension.vm?.service?.get('/usage')) as UsageResponse);
+      const next = (await dd.extension.vm?.service?.get('/usage')) as UsageResponse;
+      setUsage(next);
+      setUsageCached(false);
+      try { localStorage.setItem(USAGE_CACHE_KEY, JSON.stringify(next)); } catch {}
     } catch (e: any) {
       setUsageErr(e?.message ?? String(e));
     } finally {
@@ -224,9 +262,11 @@ export function App() {
 
   const refreshPlatform = React.useCallback(async () => {
     try {
-      setPlatform((await dd.extension.vm?.service?.get('/platform')) as Platform);
+      const next = (await dd.extension.vm?.service?.get('/platform')) as Platform;
+      setPlatform(next);
+      try { localStorage.setItem(PLATFORM_CACHE_KEY, JSON.stringify(next)); } catch {}
     } catch {
-      setPlatform(null);
+      setPlatform((current) => current ?? null);
     }
   }, [dd]);
 
@@ -236,9 +276,12 @@ export function App() {
       const r = await dd.extension.host?.cli.exec('dsm-host.cmd', ['status']);
       const out = (r?.stdout ?? '').trim();
       if (!out) throw new Error('Virtual disk helper returned no output. Windows VHDX support may be unavailable.');
-      setHostStatus(JSON.parse(out));
+      const nextStatus = JSON.parse(out) as HostStatus;
+      setHostStatus(nextStatus);
+      setHostStatusCached(false);
+      localStorage.setItem(HOST_STATUS_CACHE_KEY, JSON.stringify(nextStatus));
     } catch (e: any) {
-      setHostStatus(null);
+      setHostStatus((current) => current ?? null);
       setHostErr(e?.message ?? String(e));
     }
   }, [dd]);
@@ -389,6 +432,7 @@ export function App() {
     setLastResult(null);
     try {
       await runPrune('containers', false);
+      await runPrune('images', true);
       await runPrune('build-cache', true);
       if (!fstrimDisabledReason) {
         await runFstrim();
@@ -466,7 +510,7 @@ export function App() {
 
       {lastResult && (
         <Alert severity={lastResult.includes('failed') ? 'error' : 'success'} sx={{ mb: 2 }} onClose={() => setLastResult(null)}>
-          <pre style={{ whiteSpace: 'pre-wrap', margin: 0 }}>{lastResult}</pre>
+          <Box component="pre" sx={{ whiteSpace: 'pre-wrap', m: 0, maxHeight: 180, overflow: 'auto' }}>{lastResult}</Box>
         </Alert>
       )}
 
@@ -546,6 +590,7 @@ export function App() {
                         <Typography variant="caption" color="text.secondary" sx={{ textTransform: 'uppercase', letterSpacing: 0.6 }}>Docker reclaimable</Typography>
                       </Stack>
                       <Typography variant="h6" sx={{ fontWeight: 600, lineHeight: 1.2 }}>{usage ? fmtBytes(reclaimableBytes) : '—'}</Typography>
+                      <Typography variant="caption" color="text.secondary" sx={{ display: 'block', minHeight: 18, visibility: usageCached ? 'visible' : 'hidden' }}>refreshing…</Typography>
                     </Box>
                   </Tooltip>
                   <Tooltip title={compactable.bytes > 0 ? `${compactableSourceLabel(compactable.source)}${compactable.partial ? ' Some disks omitted.' : ''} Actual compaction may differ.` : compactableSourceLabel('none')}>
@@ -555,6 +600,7 @@ export function App() {
                         <Typography variant="caption" color="text.secondary" sx={{ textTransform: 'uppercase', letterSpacing: 0.6 }}>Compactable est.</Typography>
                       </Stack>
                       <Typography variant="h6" color={compactable.bytes > 0 ? 'success.main' : 'text.secondary'} sx={{ fontWeight: 600, lineHeight: 1.2 }}>{compactable.bytes > 0 ? fmtBytes(compactable.bytes) : '—'}</Typography>
+                      <Typography variant="caption" color="text.secondary" sx={{ display: 'block', minHeight: 18, visibility: hostStatusCached && compactable.bytes > 0 ? 'visible' : 'hidden' }}>refreshing…</Typography>
                     </Box>
                   </Tooltip>
                 </Stack>
@@ -596,6 +642,7 @@ export function App() {
                       Reclaim space
                     </Button>
                     <Chip size="small" variant="outlined" color="error" label="Deletes stopped containers" />
+                    <Chip size="small" variant="outlined" color="error" label="Deletes unused images" />
                     <Chip size="small" variant="outlined" color="warning" label="Clears build cache" />
                     <Chip size="small" variant="outlined" label="Pauses Docker briefly" />
                   </Stack>
@@ -736,11 +783,13 @@ export function App() {
               <b>This will delete:</b>
               <ul style={{ marginTop: 4, marginBottom: 8 }}>
                 <li>Stopped containers (running containers are kept)</li>
+                <li>Images not used by any container (<code>docker image prune -a</code>)</li>
                 <li>Unused build cache</li>
               </ul>
               <b>This will not delete:</b>
               <ul style={{ marginTop: 4, marginBottom: 8 }}>
-                <li>Images, volumes, networks</li>
+                <li>Volumes, networks</li>
+                <li>Images currently in use by a container</li>
                 <li>Running containers (they are stopped, then restarted)</li>
               </ul>
               After cleanup, the engine VM is trimmed and you'll get a second confirmation before Docker Desktop shuts down for VHDX compaction.
