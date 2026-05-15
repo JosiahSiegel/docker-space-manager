@@ -282,6 +282,7 @@ export function App() {
   const doCompact = async () => {
     setRunning('compact');
     setLastResult(null);
+    setLastCompactSummary(null);
     const preSnapshot = new Map((hostStatus?.vhdx ?? []).map((v) => [v.path, v.bytes]));
     try {
       await dd.extension.host?.cli.exec('dsm-host.cmd', ['compact']);

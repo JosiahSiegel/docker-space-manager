@@ -181,21 +181,72 @@ if ($Mode -eq 'Status') {
     return
 }
 
+function Wait-ForExit {
+    param([string]$Message = 'Press Enter to close this window')
+    try { Read-Host $Message | Out-Null } catch { }
+}
+
 # --- Compact mode (requires admin) ---
 if (-not (Test-Admin)) {
-    Write-Error 'compact.ps1 -Mode Compact must run elevated.'
+    Write-Host 'ERROR: compact.ps1 -Mode Compact must run elevated.' -ForegroundColor Red
+    Wait-ForExit
     exit 1
 }
 
 $lockPath = Join-Path $env:TEMP 'dsm-compact.lock'
-try {
-    $lockStream = [System.IO.File]::Open($lockPath, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
-    $lockBytes = [System.Text.Encoding]::UTF8.GetBytes("pid=$PID started=$(Get-Date -Format o)")
-    $lockStream.Write($lockBytes, 0, $lockBytes.Length)
-} catch {
-    Write-Error "Another Docker Space Manager compaction is already running. If this is stale, remove $lockPath after confirming no compaction window is open."
-    exit 1
+function Open-CompactLock {
+    param([string]$Path)
+    return [System.IO.File]::Open($Path, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
 }
+
+$lockStream = $null
+try {
+    $lockStream = Open-CompactLock -Path $lockPath
+} catch {
+    # CreateNew failed. Inspect the existing lock: if the PID it names is no
+    # longer alive, the lock is stale (previous run crashed before its finally
+    # ran) and we can safely reclaim it.
+    $stale = $false
+    try {
+        $existing = Get-Content -LiteralPath $lockPath -ErrorAction Stop -Raw
+        Write-DsmLog "lock: existing contents=[$existing]"
+        if ($existing -match 'pid=(\d+)') {
+            $heldPid = [int]$Matches[1]
+            $holder = Get-Process -Id $heldPid -ErrorAction SilentlyContinue
+            if (-not $holder) {
+                Write-DsmLog "lock: holder pid=$heldPid no longer alive, treating as stale"
+                $stale = $true
+            } else {
+                Write-DsmLog "lock: holder pid=$heldPid still alive ($($holder.ProcessName))"
+            }
+        } else {
+            Write-DsmLog 'lock: no pid recorded, treating as stale'
+            $stale = $true
+        }
+    } catch {
+        Write-DsmLog "lock: could not read existing lock ($($_.Exception.Message)), treating as stale"
+        $stale = $true
+    }
+
+    if ($stale) {
+        Remove-Item -LiteralPath $lockPath -Force -ErrorAction SilentlyContinue
+        try {
+            $lockStream = Open-CompactLock -Path $lockPath
+        } catch {
+            Write-Host "ERROR: Could not acquire compaction lock at $lockPath even after removing stale entry: $($_.Exception.Message)" -ForegroundColor Red
+            Wait-ForExit
+            exit 1
+        }
+    } else {
+        Write-Host "ERROR: Another Docker Space Manager compaction is already running (lock at $lockPath). If this is wrong, close any other compaction window and delete that file." -ForegroundColor Red
+        Wait-ForExit
+        exit 1
+    }
+}
+
+$lockBytes = [System.Text.Encoding]::UTF8.GetBytes("pid=$PID started=$(Get-Date -Format o)")
+$lockStream.Write($lockBytes, 0, $lockBytes.Length)
+$lockStream.Flush()
 
 try {
 Write-Host '==> Stopping Docker Desktop and WSL'
@@ -209,21 +260,38 @@ $dockerProcs = @('Docker Desktop', 'com.docker.backend', 'com.docker.service', '
 $dockerDesktopExe = Resolve-DockerDesktopExe
 Write-DsmLog "resolved dockerDesktopExe=$dockerDesktopExe"
 
-$gracefulIssued = $false
-if (Get-Command docker -ErrorAction SilentlyContinue) {
-    Write-Host '  graceful: docker desktop stop'
-    try {
-        & docker desktop stop 2>&1 | Out-Null
-        if ($LASTEXITCODE -eq 0) {
-            $gracefulIssued = $true
-            Write-DsmLog 'graceful: docker desktop stop returned 0'
-        } else {
-            Write-DsmLog "graceful: docker desktop stop exit=$LASTEXITCODE"
-        }
-    } catch {
-        Write-DsmLog "graceful: docker desktop stop threw $($_.Exception.Message)"
+function Invoke-DockerDesktopStopBounded {
+    param([int]$TimeoutSeconds = 25)
+    $dockerExe = (Get-Command docker -ErrorAction SilentlyContinue).Source
+    if (-not $dockerExe) { return 'missing' }
+
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $dockerExe
+    $psi.Arguments = 'desktop stop'
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $proc = [System.Diagnostics.Process]::Start($psi)
+
+    if ($proc.WaitForExit($TimeoutSeconds * 1000)) {
+        $stdout = $proc.StandardOutput.ReadToEnd()
+        $stderr = $proc.StandardError.ReadToEnd()
+        Write-DsmLog "graceful: docker desktop stop exit=$($proc.ExitCode) out=[$stdout] err=[$stderr]"
+        if ($proc.ExitCode -eq 0) { return 'ok' }
+        return 'failed'
     }
+
+    Write-Host '  docker desktop stop did not return within timeout; killing CLI and falling back'
+    Write-DsmLog 'graceful: docker desktop stop timed out, killing CLI'
+    try { $proc.Kill() } catch { }
+    return 'timeout'
 }
+
+$gracefulIssued = $false
+Write-Host '  graceful: docker desktop stop (timeout 25s)'
+$stopResult = Invoke-DockerDesktopStopBounded -TimeoutSeconds 25
+if ($stopResult -eq 'ok') { $gracefulIssued = $true }
 
 if (-not $gracefulIssued -and $dockerDesktopExe) {
     Write-Host "  graceful: `"$dockerDesktopExe`" -Quit"
@@ -237,9 +305,10 @@ if (-not $gracefulIssued -and $dockerDesktopExe) {
 }
 
 if (-not $gracefulIssued) {
-    Write-Host '  no graceful shutdown path available; will rely on force-stop'
+    Write-Host '  no graceful shutdown path completed; will rely on force-stop'
 }
 
+Write-Host '  waiting up to 20s for Docker processes to exit...'
 $gracefulDeadline = (Get-Date).AddSeconds(20)
 while ((Get-Date) -lt $gracefulDeadline) {
     $still = $dockerProcs | ForEach-Object { Get-Process -Name $_ -ErrorAction SilentlyContinue }
