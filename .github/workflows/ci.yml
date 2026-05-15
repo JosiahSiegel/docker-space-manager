@@ -65,7 +65,12 @@ jobs:
       - name: Analyze compact.ps1
         shell: pwsh
         run: |
-          $results = Invoke-ScriptAnalyzer -Path host/windows -Recurse -Severity Warning,Error
+          # compact.ps1 runs interactively in an elevated PowerShell window;
+          # Write-Host is intentional so the user sees progress, empty catches
+          # are best-effort fallbacks (registry probes, optional cleanup), and
+          # the plural-noun helpers genuinely return collections.
+          $excluded = @('PSAvoidUsingWriteHost', 'PSAvoidUsingEmptyCatchBlock', 'PSUseSingularNouns')
+          $results = Invoke-ScriptAnalyzer -Path host/windows -Recurse -Severity Warning,Error -ExcludeRule $excluded
           if ($results) {
             $results | Format-Table -AutoSize
             exit 1
