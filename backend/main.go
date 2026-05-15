@@ -143,7 +143,6 @@ func getUsage(ctx echo.Context) error {
 	if err != nil {
 		return ctx.JSON(http.StatusOK, map[string]any{
 			"summary":     []UsageEntry{},
-			"verboseRaw":  "",
 			"collectedAt": time.Now().UTC().Format(time.RFC3339),
 			"warning":     fmt.Sprintf("Docker could not calculate disk usage: %s", err.Error()),
 		})
@@ -160,10 +159,8 @@ func getUsage(ctx echo.Context) error {
 		entries = append(entries, e)
 	}
 
-	verbose, _ := dockerJSON("system", "df", "-v", "--format", "{{json .}}")
 	return ctx.JSON(http.StatusOK, map[string]any{
 		"summary":     entries,
-		"verboseRaw":  string(verbose),
 		"collectedAt": time.Now().UTC().Format(time.RFC3339),
 		"warning":     "",
 	})

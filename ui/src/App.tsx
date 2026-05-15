@@ -30,11 +30,13 @@ const client = createDockerDesktopClient();
 const useDD = () => client;
 
 type UsageEntry = { Type: string; Total: string; Active: string; Size: string; Reclaimable: string };
-type UsageResponse = { summary: UsageEntry[]; verboseRaw: string; collectedAt: string; warning?: string };
+type UsageResponse = { summary: UsageEntry[]; verboseRaw?: string; collectedAt: string; warning?: string };
 type ContainerRow = { id: string; image: string; names: string; state: string; status: string; size: string };
 type Hotspot = { path: string; bytes: number };
-type VhdxEntry = { path: string; bytes: number };
+type VhdxEntry = { path: string; bytes: number; fileSize?: number; minimumSize?: number; usedBytes?: number };
 type HostStatus = { admin: boolean; vhdx: VhdxEntry[] };
+type CompactResultRow = { path: string; before: number; after: number; reclaimed: number };
+type CompactSummary = { totalReclaimed: number; preTotal: number; postTotal: number; rows: CompactResultRow[]; at: string };
 type Platform = { isDockerDesktop: boolean; operatingSystem: string; osType: string; name: string };
 type PruneTarget = 'images' | 'build-cache' | 'volumes' | 'containers' | 'all';
 type PendingAction =
@@ -74,28 +76,89 @@ function sumReclaimable(summary: UsageEntry[] | undefined): number {
   return summary.reduce((acc, e) => acc + parseReclaimableBytes(e.Reclaimable), 0);
 }
 
-function diskGradient(vhdx: VhdxEntry[]): string {
-  const total = vhdx.reduce((s, v) => s + v.bytes, 0) || 1;
-  const colors = ['#1d63ed', '#00b8a9', '#ffb020', '#d14343', '#7c3aed', '#64748b'];
-  let cursor = 0;
-  const parts = [...vhdx]
-    .sort((a, b) => b.bytes - a.bytes)
-    .map((v, i) => {
-      const start = cursor;
-      cursor += (v.bytes / total) * 100;
-      return `${colors[i % colors.length]} ${start}% ${cursor}%`;
-    });
+const DONUT_RECLAIM_COLOR = '#ed6c02';
+const DONUT_COMPACT_COLOR = '#2e7d32';
+const DONUT_USED_COLOR = '#cfd8dc';
+
+function compositeDonutGradient(
+  totalBytes: number,
+  reclaimableBytes: number,
+  compactableBytes: number,
+  estimateUnavailable: boolean,
+): string {
+  if (totalBytes <= 0) return DONUT_USED_COLOR;
+  const reclaimPct = Math.max(0, Math.min(100, (reclaimableBytes / totalBytes) * 100));
+  const compactPct = Math.max(0, Math.min(100 - reclaimPct, (compactableBytes / totalBytes) * 100));
+  if (reclaimPct <= 0 && compactPct <= 0) {
+    if (estimateUnavailable) {
+      return 'repeating-conic-gradient(#cfd8dc 0deg 6deg, #eceff1 6deg 12deg)';
+    }
+    return DONUT_USED_COLOR;
+  }
+  const usedStart = reclaimPct + compactPct;
+  const parts: string[] = [];
+  if (reclaimPct > 0) parts.push(`${DONUT_RECLAIM_COLOR} 0 ${reclaimPct}%`);
+  if (compactPct > 0) parts.push(`${DONUT_COMPACT_COLOR} ${reclaimPct}% ${usedStart}%`);
+  parts.push(`${DONUT_USED_COLOR} ${usedStart}% 100%`);
   return `conic-gradient(${parts.join(', ')})`;
 }
 
-function reclaimStripeGradient(totalBytes: number, reclaimableBytes: number, estimateUnavailable: boolean): string {
-  if (totalBytes <= 0) return 'transparent';
-  if (estimateUnavailable) {
-    return 'repeating-conic-gradient(from -12deg, rgba(17,24,39,0.72) 0deg 5deg, rgba(255,255,255,0.92) 5deg 10deg, transparent 10deg 16deg)';
+function compactSavingsGradient(preTotalBytes: number, reclaimedBytes: number): string {
+  if (preTotalBytes <= 0 || reclaimedBytes <= 0) return 'transparent';
+  const pct = Math.min(100, (reclaimedBytes / preTotalBytes) * 100);
+  return `conic-gradient(rgba(46,125,50,0.85) 0 ${pct}%, transparent ${pct}% 100%)`;
+}
+
+type CompactableSource = 'vhd' | 'engine' | 'mixed' | 'none';
+
+function compactableEstimate(vhdx: VhdxEntry[]): { bytes: number; partial: boolean; complete: boolean; source: CompactableSource } {
+  let bytes = 0;
+  let reported = 0;
+  let usedVhd = false;
+  let usedEngine = false;
+  for (const v of vhdx) {
+    let reclaimable: number | null = null;
+    if (v.fileSize != null && v.minimumSize != null) {
+      reclaimable = Number(v.fileSize) - Number(v.minimumSize);
+      usedVhd = true;
+    } else if (v.usedBytes != null) {
+      reclaimable = Number(v.bytes) - Number(v.usedBytes);
+      usedEngine = true;
+    } else {
+      continue;
+    }
+    reported++;
+    if (!Number.isFinite(reclaimable) || reclaimable <= 0) continue;
+    bytes += reclaimable;
   }
-  if (reclaimableBytes <= 0) return 'transparent';
-  const pct = Math.min(100, (reclaimableBytes / totalBytes) * 100);
-  return `conic-gradient(rgba(17,24,39,0.72) 0 ${pct}%, transparent ${pct}% 100%)`;
+  const source: CompactableSource = usedVhd && usedEngine ? 'mixed' : usedVhd ? 'vhd' : usedEngine ? 'engine' : 'none';
+  return { bytes, partial: reported > 0 && reported < vhdx.length, complete: vhdx.length > 0 && reported === vhdx.length, source };
+}
+
+function compactableSourceLabel(source: CompactableSource): string {
+  if (source === 'vhd') return 'From Hyper-V VHDX minimum size.';
+  if (source === 'engine') return 'Estimated from Docker engine filesystem usage.';
+  if (source === 'mixed') return 'Mix of Hyper-V VHDX minimum size and Docker engine filesystem usage.';
+  return 'Unavailable until Windows can read VHDX minimum size or Docker can report engine filesystem usage.';
+}
+
+function parseCompactResult(out: string): CompactResultRow[] | null {
+  const trimmed = out.trim();
+  if (!trimmed) return null;
+  try {
+    const parsed = JSON.parse(trimmed);
+    const rows = Array.isArray(parsed) ? parsed : [parsed];
+    return rows
+      .filter((r) => r && typeof r.path === 'string')
+      .map((r) => ({
+        path: String(r.path),
+        before: Number(r.before) || 0,
+        after: Number(r.after) || 0,
+        reclaimed: Number(r.reclaimed) || 0,
+      }));
+  } catch {
+    return null;
+  }
 }
 
 export function App() {
@@ -117,6 +180,7 @@ export function App() {
   const [pendingAction, setPendingAction] = React.useState<PendingAction | null>(null);
   const [confirming, setConfirming] = React.useState(false);
   const [lastResult, setLastResult] = React.useState<string | null>(null);
+  const [lastCompactSummary, setLastCompactSummary] = React.useState<CompactSummary | null>(null);
 
   const refreshUsage = React.useCallback(async () => {
     setUsageLoading(true);
@@ -161,10 +225,7 @@ export function App() {
   }, [dd]);
 
   React.useEffect(() => {
-    refreshPlatform();
-    refreshHostStatus();
-    refreshUsage();
-    refreshContainers();
+    void Promise.all([refreshPlatform(), refreshHostStatus(), refreshUsage(), refreshContainers()]);
   }, [refreshPlatform, refreshHostStatus, refreshUsage, refreshContainers]);
 
   const loadHotspots = async (id: string) => {
@@ -221,9 +282,24 @@ export function App() {
   const doCompact = async () => {
     setRunning('compact');
     setLastResult(null);
+    const preSnapshot = new Map((hostStatus?.vhdx ?? []).map((v) => [v.path, v.bytes]));
     try {
       await dd.extension.host?.cli.exec('dsm-host.cmd', ['compact']);
-      setLastResult('Compaction launched. Docker Desktop will shut down and reload after restart.');
+      try {
+        const r = await dd.extension.host?.cli.exec('dsm-host.cmd', ['result']);
+        const rows = parseCompactResult(r?.stdout ?? '');
+        if (rows && rows.length) {
+          const preTotal = rows.reduce((s, row) => s + (preSnapshot.get(row.path) ?? row.before ?? 0), 0);
+          const postTotal = rows.reduce((s, row) => s + (row.after ?? 0), 0);
+          const totalReclaimed = rows.reduce((s, row) => s + (row.reclaimed ?? 0), 0);
+          setLastCompactSummary({ rows, preTotal, postTotal, totalReclaimed, at: new Date().toISOString() });
+          setLastResult(`Compaction reclaimed ${fmtBytes(totalReclaimed)} across ${rows.length} disk${rows.length === 1 ? '' : 's'}.`);
+        } else {
+          setLastResult('Compaction launched. Docker Desktop will shut down and reload after restart.');
+        }
+      } catch {
+        setLastResult('Compaction launched. Docker Desktop will shut down and reload after restart.');
+      }
     } catch (e: any) {
       setLastResult(`Compaction failed: ${e?.message ?? e}`);
     } finally {
@@ -273,16 +349,13 @@ export function App() {
   const biggestVhdx = sortedVhdx[0];
   const reclaimableBytes = sumReclaimable(usage?.summary);
   const reclaimEstimateUnavailable = Boolean(usage?.warning || (usage && usage.summary.length === 0));
-  const reclaimablePct = totalVhdxBytes ? Math.min(100, (reclaimableBytes / totalVhdxBytes) * 100) : 0;
+  const compactable = compactableEstimate(vhdx);
 
   return (
     <Box sx={{ py: 1 }}>
       <Stack direction="row" alignItems="center" justifyContent="space-between" sx={{ mb: 2 }}>
-        <Box>
-          <Typography variant="h5">Virtual Disk Reclaimer</Typography>
-          <Typography variant="body2" color="text.secondary">Shrink Docker Desktop's WSL2 disks after Docker cleanup has already freed space.</Typography>
-        </Box>
-        <Button onClick={() => { refreshHostStatus(); refreshUsage(); refreshContainers(); }}>Refresh</Button>
+        <Typography variant="h6">Virtual Disk Reclaimer</Typography>
+        <Button size="small" onClick={() => { refreshHostStatus(); refreshUsage(); refreshContainers(); }}>Refresh</Button>
       </Stack>
 
       {lastResult && (
@@ -303,119 +376,122 @@ export function App() {
         <Stack spacing={2}>
           <Paper sx={{ p: 3 }}>
             <Stack direction={{ xs: 'column', md: 'row' }} spacing={3} alignItems="center">
-              <Box sx={{ position: 'relative', width: 210, height: 210 }}>
+              <Box sx={{ position: 'relative', width: 200, height: 200, flexShrink: 0 }}>
                 <Box
                   sx={{
                     position: 'absolute',
                     inset: 0,
                     borderRadius: '50%',
-                    background: vhdx.length ? diskGradient(sortedVhdx) : '#d9dee8',
                     boxShadow: 'inset 0 0 0 1px rgba(0,0,0,0.08)',
+                    zIndex: 0,
+                  }}
+                  style={{
+                    background: vhdx.length
+                      ? compositeDonutGradient(totalVhdxBytes, reclaimableBytes, compactable.bytes, reclaimEstimateUnavailable)
+                      : DONUT_USED_COLOR,
                   }}
                 />
-                <Box
-                  sx={{
-                    position: 'absolute',
-                    inset: 0,
-                    borderRadius: '50%',
-                    background: reclaimStripeGradient(totalVhdxBytes, reclaimableBytes, reclaimEstimateUnavailable),
-                    boxShadow: reclaimableBytes > 0 ? 'inset 0 0 0 2px rgba(17,24,39,0.35)' : undefined,
-                    pointerEvents: 'none',
-                  }}
-                />
-                <Box sx={{ position: 'absolute', inset: 38, borderRadius: '50%', bgcolor: 'background.paper', display: 'grid', placeItems: 'center', textAlign: 'center', p: 1 }}>
+                {lastCompactSummary && lastCompactSummary.totalReclaimed > 0 && (
+                  <Box
+                    sx={{ position: 'absolute', inset: 0, borderRadius: '50%', pointerEvents: 'none', zIndex: 1 }}
+                    style={{ background: compactSavingsGradient(lastCompactSummary.preTotal, lastCompactSummary.totalReclaimed) }}
+                  />
+                )}
+                <Box sx={{ position: 'absolute', inset: 36, borderRadius: '50%', bgcolor: 'background.paper', display: 'grid', placeItems: 'center', textAlign: 'center', p: 1, zIndex: 4 }}>
                   <Box>
                     <Typography variant="caption" color="text.secondary">VHDX total</Typography>
-                    <Typography variant="h4">{fmtBytes(totalVhdxBytes)}</Typography>
-                    {reclaimEstimateUnavailable ? (
-                      <Typography variant="caption" color="warning.main" sx={{ fontWeight: 600 }}>estimate unavailable</Typography>
-                    ) : reclaimablePct > 0 ? (
-                      <Typography variant="caption" color="warning.main" sx={{ fontWeight: 600 }}>~{reclaimablePct.toFixed(0)}% reclaimable</Typography>
+                    <Typography variant="h4" sx={{ lineHeight: 1.1 }}>{fmtBytes(totalVhdxBytes)}</Typography>
+                    {lastCompactSummary && lastCompactSummary.totalReclaimed > 0 ? (
+                      <Typography variant="caption" color="success.main" sx={{ fontWeight: 600, display: 'block', mt: 0.25 }}>
+                        −{fmtBytes(lastCompactSummary.totalReclaimed)} reclaimed
+                      </Typography>
+                    ) : compactable.bytes > 0 ? (
+                      <Tooltip title={`${compactableSourceLabel(compactable.source)}${compactable.partial ? ' Some disks omitted.' : ''}`}>
+                        <Typography variant="caption" color="success.main" sx={{ fontWeight: 600, display: 'block', mt: 0.25 }}>
+                          ~{fmtBytes(compactable.bytes)} compactable
+                        </Typography>
+                      </Tooltip>
+                    ) : reclaimEstimateUnavailable ? (
+                      <Typography variant="caption" color="warning.main" sx={{ fontWeight: 600, display: 'block', mt: 0.25 }}>estimate unavailable</Typography>
                     ) : null}
                   </Box>
                 </Box>
               </Box>
 
               <Box sx={{ flex: 1, minWidth: 0 }}>
-                <Typography variant="overline" color="text.secondary">
-                  {vhdx.length ? `${vhdx.length} virtual disk${vhdx.length === 1 ? '' : 's'} found` : 'No virtual disks found'}
-                </Typography>
                 <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
-                  {biggestVhdx ? `${shortName(biggestVhdx.path)} is the largest at ${fmtBytes(biggestVhdx.bytes)}.` : 'Looking for Docker Desktop WSL2 VHDX files.'}
-                  {reclaimEstimateUnavailable ? ` The striped ring means Docker could not calculate reclaimable space right now; compact-only savings can still be measured after compaction.` : reclaimableBytes > 0 ? ` The dark slice shows Docker's reported reclaimable space; compact-only savings may be higher but can only be measured after compaction.` : ''}
+                  {biggestVhdx
+                    ? `${vhdx.length} virtual disk${vhdx.length === 1 ? '' : 's'} · largest ${shortName(biggestVhdx.path)} at ${fmtBytes(biggestVhdx.bytes)}`
+                    : 'No Docker Desktop WSL2 virtual disks found.'}
                 </Typography>
 
-                <Stack direction="row" spacing={4} sx={{ mb: 3 }}>
+                <Stack direction="row" spacing={4} sx={{ mb: 2.5, flexWrap: 'wrap', rowGap: 1.5 }}>
                   <Box>
-                    <Typography variant="caption" color="text.secondary" sx={{ textTransform: 'uppercase', letterSpacing: 0.6 }}>Size on disk</Typography>
+                    <Stack direction="row" spacing={0.75} alignItems="center">
+                      <Box sx={{ width: 8, height: 8, borderRadius: '2px', bgcolor: DONUT_USED_COLOR, border: '1px solid rgba(0,0,0,0.12)' }} />
+                      <Typography variant="caption" color="text.secondary" sx={{ textTransform: 'uppercase', letterSpacing: 0.6 }}>Size on disk</Typography>
+                    </Stack>
                     <Typography variant="h6" sx={{ fontWeight: 600, lineHeight: 1.2 }}>{fmtBytes(totalVhdxBytes)}</Typography>
-                    <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mt: 0.25 }}>VHDX file size. Only compaction shrinks this.</Typography>
                   </Box>
-                  <Box>
-                    <Typography variant="caption" color="text.secondary" sx={{ textTransform: 'uppercase', letterSpacing: 0.6 }}>Docker reclaimable</Typography>
-                    <Typography variant="h6" sx={{ fontWeight: 600, lineHeight: 1.2 }}>{usage ? fmtBytes(reclaimableBytes) : '—'}</Typography>
-                    <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mt: 0.25 }}>Waste inside the VHDX. Reclaim space frees it so compaction can shrink the file more.</Typography>
-                  </Box>
+                  <Tooltip title="Waste Docker has identified inside the VHDX. Reclaim space frees it so compaction can shrink the file further.">
+                    <Box>
+                      <Stack direction="row" spacing={0.75} alignItems="center">
+                        <Box sx={{ width: 8, height: 8, borderRadius: '2px', bgcolor: DONUT_RECLAIM_COLOR }} />
+                        <Typography variant="caption" color="text.secondary" sx={{ textTransform: 'uppercase', letterSpacing: 0.6 }}>Docker reclaimable</Typography>
+                      </Stack>
+                      <Typography variant="h6" sx={{ fontWeight: 600, lineHeight: 1.2 }}>{usage ? fmtBytes(reclaimableBytes) : '—'}</Typography>
+                    </Box>
+                  </Tooltip>
+                  <Tooltip title={compactable.bytes > 0 ? `${compactableSourceLabel(compactable.source)}${compactable.partial ? ' Some disks omitted.' : ''} Actual compaction may differ.` : compactableSourceLabel('none')}>
+                    <Box>
+                      <Stack direction="row" spacing={0.75} alignItems="center">
+                        <Box sx={{ width: 8, height: 8, borderRadius: '2px', bgcolor: compactable.bytes > 0 ? DONUT_COMPACT_COLOR : 'rgba(0,0,0,0.16)' }} />
+                        <Typography variant="caption" color="text.secondary" sx={{ textTransform: 'uppercase', letterSpacing: 0.6 }}>Compactable est.</Typography>
+                      </Stack>
+                      <Typography variant="h6" color={compactable.bytes > 0 ? 'success.main' : 'text.secondary'} sx={{ fontWeight: 600, lineHeight: 1.2 }}>{compactable.bytes > 0 ? fmtBytes(compactable.bytes) : '—'}</Typography>
+                    </Box>
+                  </Tooltip>
                 </Stack>
 
-                <Stack direction="row" spacing={1} alignItems="center">
-                  <Button variant="contained" size="large" color="warning" disabled={!vhdx.length || commandBusy} onClick={() => setPendingAction({ kind: 'magic' })}>
-                    {running ? <CircularProgress size={18} sx={{ mr: 1 }} /> : null}
-                    Reclaim space
-                  </Button>
-                  <Button variant="text" size="large" disabled={!vhdx.length || commandBusy} onClick={() => setPendingAction({ kind: 'compact' })}>
-                    Compact only
-                  </Button>
+                <Stack spacing={1.25}>
+                  <Stack direction="row" spacing={1} alignItems="center" flexWrap="wrap" rowGap={0.75}>
+                    <Button sx={{ minWidth: 160 }} variant="contained" color="warning" disabled={!vhdx.length || commandBusy} onClick={() => setPendingAction({ kind: 'magic' })}>
+                      {running === 'magic' ? <CircularProgress size={16} sx={{ mr: 1 }} /> : null}
+                      Reclaim space
+                    </Button>
+                    <Chip size="small" variant="outlined" color="error" label="Deletes stopped containers" />
+                    <Chip size="small" variant="outlined" color="warning" label="Clears build cache" />
+                    <Chip size="small" variant="outlined" label="Pauses Docker briefly" />
+                  </Stack>
+                  <Stack direction="row" spacing={1} alignItems="center" flexWrap="wrap" rowGap={0.75}>
+                    <Button sx={{ minWidth: 160 }} variant="contained" color="success" disabled={!vhdx.length || commandBusy} onClick={() => setPendingAction({ kind: 'compact' })}>
+                      {running === 'compact' ? <CircularProgress size={16} sx={{ mr: 1 }} /> : null}
+                      Compact only
+                    </Button>
+                    <Chip size="small" variant="outlined" color="success" label="No data deleted" />
+                    <Chip size="small" variant="outlined" label="Pauses Docker briefly" />
+                  </Stack>
                 </Stack>
-                <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mt: 1 }}>
-                  Reclaim space deletes stopped containers and build cache. Both actions stop Docker Desktop during compaction, so running containers stop temporarily.
-                </Typography>
               </Box>
             </Stack>
           </Paper>
 
-          <Stack direction={{ xs: 'column', md: 'row' }} spacing={2}>
-            <ActionPath
-              title="Reclaim space"
-              reclaimsLabel="Docker reclaimable + Size on disk"
-              reclaimsDetail="Frees waste inside the VHDX, then compacts the file to shrink it on disk."
-              steps={[
-                { text: 'docker container prune — deletes stopped containers', kind: 'destructive', note: 'Running containers, images, and volumes are kept.' },
-                { text: 'docker builder prune -a — deletes unused build cache', kind: 'destructive', note: 'Cache only. No images, containers, or volumes touched.' },
-                { text: 'fstrim -av — marks freed blocks inside the VM', kind: 'safe', note: 'No data is removed.' },
-                { text: 'Compact VHDX (UAC) — shuts Docker down and shrinks the file', kind: 'downtime', note: 'No data loss. Docker Desktop restarts when finished.' },
-              ]}
-              active={Boolean(running?.startsWith('prune')) || running === 'fstrim'}
-            />
-            <ActionPath
-              title="Compact only"
-              reclaimsLabel="Size on disk"
-              reclaimsDetail="Shrinks VHDX files using free space already inside them. Docker reclaimable is untouched."
-              steps={[
-                { text: 'Stops Docker Desktop and shuts WSL down', kind: 'downtime', note: 'Running containers stop temporarily.' },
-                { text: 'Prompts for admin (UAC)', kind: 'safe', note: 'Required so diskpart can attach the VHDX.' },
-                { text: 'diskpart compact vdisk per file', kind: 'safe', note: 'Shrinks the virtual disk only. Contents are preserved.' },
-                { text: 'Docker Desktop restarts automatically', kind: 'safe', note: 'Containers, images, volumes, and build cache come back untouched.' },
-              ]}
-              active={running === 'compact'}
-            />
-          </Stack>
-
-          <Paper sx={{ p: 2 }}>
-            <Typography variant="subtitle2" sx={{ mb: 1 }}>Largest disks</Typography>
-            <Stack spacing={1}>
-              {sortedVhdx.slice(0, 4).map((v) => (
-                <Box key={v.path}>
-                  <Stack direction="row" justifyContent="space-between" spacing={2}>
-                    <Typography variant="body2" sx={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{shortName(v.path)}</Typography>
-                    <Typography variant="body2">{fmtBytes(v.bytes)}</Typography>
-                  </Stack>
-                  <LinearProgress variant="determinate" value={totalVhdxBytes ? (v.bytes / totalVhdxBytes) * 100 : 0} sx={{ height: 8, borderRadius: 4 }} />
-                </Box>
-              ))}
-              {sortedVhdx.length === 0 && <Typography variant="body2" color="text.secondary">No Docker Desktop VHDX files found.</Typography>}
-            </Stack>
-          </Paper>
+          {sortedVhdx.length > 1 && (
+            <Paper sx={{ p: 2 }}>
+              <Typography variant="subtitle2" sx={{ mb: 1 }}>Largest disks</Typography>
+              <Stack spacing={1}>
+                {sortedVhdx.slice(0, 4).map((v) => (
+                  <Box key={v.path}>
+                    <Stack direction="row" justifyContent="space-between" spacing={2}>
+                      <Typography variant="body2" sx={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{shortName(v.path)}</Typography>
+                      <Typography variant="body2">{fmtBytes(v.bytes)}</Typography>
+                    </Stack>
+                    <LinearProgress variant="determinate" value={totalVhdxBytes ? (v.bytes / totalVhdxBytes) * 100 : 0} sx={{ height: 6, borderRadius: 3 }} />
+                  </Box>
+                ))}
+              </Stack>
+            </Paper>
+          )}
         </Stack>
       )}
 
@@ -451,7 +527,7 @@ export function App() {
           <Paper sx={{ p: 2 }}>
             <Typography variant="h6" sx={{ mb: 0.5 }}>Manual prep actions</Typography>
             <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
-              Red actions delete Docker data. Orange actions stop Docker Desktop or running containers. Green actions do neither.
+              The orange action removes stopped containers and build cache first, then briefly pauses Docker for compaction. The green action skips cleanup and only compacts.
             </Typography>
             <Stack spacing={2}>
               <CleanupAction title="Remove stopped containers" detail="docker container prune -f" dataRisk="destructive" runtimeRisk="safe" impact="Deletes stopped containers. Running containers, images, volumes, and networks are kept." disabled={commandBusy}
@@ -566,46 +642,6 @@ export function App() {
 }
 
 type StepKind = 'safe' | 'destructive' | 'downtime';
-type ActionStep = { text: string; kind: StepKind; note: string };
-
-function stepDotColor(kind: StepKind): string {
-  if (kind === 'destructive') return 'error.main';
-  if (kind === 'downtime') return 'warning.main';
-  return 'success.main';
-}
-
-function ActionPath(props: { title: string; reclaimsLabel: string; reclaimsDetail: string; steps: ActionStep[]; active: boolean }) {
-  const dataLoss = props.steps.some((s) => s.kind === 'destructive');
-  const downtime = props.steps.some((s) => s.kind === 'downtime');
-  return (
-    <Paper variant="outlined" sx={{ p: 2, flex: 1, borderColor: props.active ? 'warning.main' : undefined }}>
-      <Stack spacing={1.5}>
-        <Box>
-          <Stack direction="row" alignItems="center" spacing={1} sx={{ mb: 0.5, flexWrap: 'wrap' }}>
-            <Typography variant="subtitle2">{props.title}</Typography>
-            <Chip size="small" variant="outlined" color={dataLoss ? 'error' : 'success'} label={dataLoss ? 'Deletes Docker data' : 'No data deleted'} />
-            {downtime && <Chip size="small" variant="outlined" color="warning" label="Stops running containers" />}
-          </Stack>
-          <Typography variant="caption" color="text.secondary" sx={{ display: 'block', textTransform: 'uppercase', letterSpacing: 0.6 }}>Reclaims</Typography>
-          <Typography variant="body2" sx={{ fontWeight: 600, lineHeight: 1.2 }}>{props.reclaimsLabel}</Typography>
-          <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mt: 0.25 }}>{props.reclaimsDetail}</Typography>
-        </Box>
-        <Divider />
-        <Stack spacing={1}>
-          {props.steps.map((step) => (
-            <Stack direction="row" spacing={1.25} alignItems="flex-start" key={step.text}>
-              <Box sx={{ width: 8, height: 8, borderRadius: '50%', bgcolor: stepDotColor(step.kind), flexShrink: 0, mt: '7px' }} />
-              <Box sx={{ minWidth: 0, flex: 1 }}>
-                <Typography variant="body2">{step.text}</Typography>
-                <Typography variant="caption" color="text.secondary" sx={{ display: 'block' }}>{step.note}</Typography>
-              </Box>
-            </Stack>
-          ))}
-        </Stack>
-      </Stack>
-    </Paper>
-  );
-}
 
 function CleanupAction(props: { title: string; detail: string; dataRisk: StepKind; runtimeRisk: StepKind; impact: string; running: boolean; disabled?: boolean; onClick: () => void; disabledReason?: string }) {
   const destructive = props.dataRisk === 'destructive';

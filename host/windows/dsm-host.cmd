@@ -14,5 +14,13 @@ if /I "%ACTION%"=="compact" (
     exit /b %ERRORLEVEL%
 )
 
-echo Usage: dsm-host.cmd ^<status^|compact^>
+if /I "%ACTION%"=="result" (
+    if exist "%TEMP%\dsm-compact-result.json" (
+        type "%TEMP%\dsm-compact-result.json"
+        exit /b 0
+    )
+    exit /b 0
+)
+
+echo Usage: dsm-host.cmd ^<status^|compact^|result^>
 exit /b 2

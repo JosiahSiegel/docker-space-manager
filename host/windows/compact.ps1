@@ -6,6 +6,29 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+Set-StrictMode -Version Latest
+
+# Docker Desktop's host CLI captures stdout as UTF-8. Windows PowerShell 5.1
+# defaults to the console code page, which would corrupt the JSON payload.
+try {
+    [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+} catch {
+}
+$OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+
+$script:LogPath = Join-Path $env:TEMP 'dsm-host.log'
+function Write-DsmLog {
+    param([string]$Message)
+    try {
+        $line = "[{0}] [{1}] {2}" -f (Get-Date -Format 'o'), $Mode, $Message
+        Add-Content -LiteralPath $script:LogPath -Value $line -Encoding UTF8 -ErrorAction SilentlyContinue
+    } catch {
+    }
+}
+Write-DsmLog "start pid=$PID psver=$($PSVersionTable.PSVersion) host=$($Host.Name)"
+
+$script:HasGetVHD = [bool](Get-Command Get-VHD -ErrorAction SilentlyContinue)
+Write-DsmLog "HasGetVHD=$script:HasGetVHD"
 
 function Find-VhdxFiles {
     $candidates = @(
@@ -22,16 +45,74 @@ function Find-VhdxFiles {
     $candidates | Where-Object { Test-Path $_ }
 }
 
+function Get-EngineUsedBytes {
+    # Single-quoted on purpose: PowerShell would otherwise eat $3 as a variable
+    # (and backslash is not its escape character).
+    $shCmd = 'df -B1 / 2>/dev/null | tail -n 1 | awk ''{print $3}'''
+    if (-not (Get-Command docker -ErrorAction SilentlyContinue)) {
+        Write-DsmLog 'engine: docker.exe not on PATH'
+        return $null
+    }
+    $prevErr = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $vmUsage = & docker run --rm --privileged --pid=host alpine sh -c $shCmd 2>$null
+        $code = $LASTEXITCODE
+        Write-DsmLog "engine: docker exit=$code raw=[$vmUsage]"
+        if ($code -eq 0 -and $vmUsage) {
+            $trimmed = ($vmUsage | Out-String).Trim()
+            if ($trimmed -match '^\d+$') {
+                $usedBytes = [int64]$trimmed
+                Write-DsmLog "engine: usedBytes=$usedBytes"
+                if ($usedBytes -gt 0) { return $usedBytes }
+            } else {
+                Write-DsmLog "engine: unparseable output [$trimmed]"
+            }
+        }
+    } catch {
+        Write-DsmLog "engine: exception $($_.Exception.Message)"
+    } finally {
+        $ErrorActionPreference = $prevErr
+    }
+    return $null
+}
+
 function Get-VhdxStatus {
     $rows = @()
     foreach ($p in (Find-VhdxFiles)) {
-        $fi = Get-Item -LiteralPath $p
-        $rows += [pscustomobject]@{
+        try {
+            $fi = Get-Item -LiteralPath $p -ErrorAction Stop
+        } catch {
+            continue
+        }
+
+        $row = [ordered]@{
             path  = $fi.FullName
             bytes = [int64]$fi.Length
         }
+
+        if ($script:HasGetVHD) {
+            try {
+                $vhd = Get-VHD -Path $fi.FullName -ErrorAction Stop
+                if ($null -ne $vhd.FileSize) { $row.fileSize = [int64]$vhd.FileSize }
+                if ($null -ne $vhd.MinimumSize) { $row.minimumSize = [int64]$vhd.MinimumSize }
+            } catch {
+                # Missing permissions, locked files, or unsupported VHDX states should not block status.
+            }
+        }
+
+        $rows += [pscustomobject]$row
     }
-    return $rows
+
+    $needsVmEstimate = $rows | Where-Object { -not $_.PSObject.Properties['minimumSize'] } | Sort-Object -Property bytes -Descending | Select-Object -First 1
+    if ($needsVmEstimate) {
+        $usedBytes = Get-EngineUsedBytes
+        if ($null -ne $usedBytes) {
+            $needsVmEstimate | Add-Member -NotePropertyName usedBytes -NotePropertyValue ([int64]$usedBytes) -Force
+        }
+    }
+
+    return ,$rows
 }
 
 function Test-Admin {
@@ -46,7 +127,13 @@ if ($Mode -eq 'Status') {
         admin = (Test-Admin)
         vhdx  = $vhdx
     }
-    $payload | ConvertTo-Json -Compress
+    $json = $payload | ConvertTo-Json -Compress -Depth 6
+    Write-DsmLog "status payload=$json"
+    # Explicit UTF-8, no BOM, no trailing CRLF mangling. [Console]::Out is a
+    # TextWriter already wired to OutputEncoding (set at script top).
+    [Console]::Out.Write($json)
+    [Console]::Out.Write([Environment]::NewLine)
+    [Console]::Out.Flush()
     return
 }
 
@@ -73,15 +160,15 @@ Write-Host '==> Stopping Docker Desktop and WSL'
 # linger past the grace window, so we don't slam containers mid-flush unnecessarily.
 $dockerProcs = @('Docker Desktop', 'com.docker.backend', 'com.docker.service', 'com.docker.dev-envs', 'Docker.Desktop.Service')
 
-$exeCandidates = @(
+$dockerDesktopExe = @(
     (Join-Path $env:ProgramFiles 'Docker\Docker\Docker Desktop.exe'),
     (Join-Path ${env:ProgramFiles(x86)} 'Docker\Docker\Docker Desktop.exe')
 ) | Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1
 
-if ($exeCandidates) {
-    Write-Host "  graceful: $exeCandidates -Quit"
+if ($dockerDesktopExe) {
+    Write-Host "  graceful: $dockerDesktopExe -Quit"
     try {
-        Start-Process -FilePath $exeCandidates -ArgumentList '-Quit' -ErrorAction Stop | Out-Null
+        Start-Process -FilePath $dockerDesktopExe -ArgumentList '-Quit' -ErrorAction Stop | Out-Null
     } catch {
         Write-Host "  graceful quit failed: $($_.Exception.Message)"
     }
@@ -133,8 +220,24 @@ foreach ($a in $after) {
     $summary += [pscustomobject]@{ path = $a.path; before = ($b.bytes); after = $a.bytes; reclaimed = $delta }
 }
 
-Write-Host '==> Done. Restart Docker Desktop manually if it did not relaunch automatically.'
 ($summary | ConvertTo-Json -Compress) | Out-File -FilePath (Join-Path $env:TEMP 'dsm-compact-result.json') -Encoding utf8
+if ($dockerDesktopExe) {
+    Write-Host '==> Done. Restarting Docker Desktop...'
+    try {
+        Start-Process -FilePath $dockerDesktopExe -ErrorAction Stop | Out-Null
+        Write-DsmLog "restart: launched $dockerDesktopExe"
+    } catch {
+        Write-DsmLog "restart: failed $($_.Exception.Message)"
+        Write-Host "==> Done. Restart Docker Desktop manually: $dockerDesktopExe"
+    }
+} else {
+    Write-DsmLog 'restart: Docker Desktop executable not found'
+    Write-Host '==> Done. Restart Docker Desktop manually.'
+}
+try {
+    Read-Host 'Press Enter to close this window'
+} catch {
+}
 } finally {
     if ($lockStream) { $lockStream.Dispose() }
     Remove-Item -LiteralPath $lockPath -Force -ErrorAction SilentlyContinue
