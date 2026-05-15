@@ -11,6 +11,7 @@ import {
   DialogContentText,
   DialogTitle,
   Divider,
+  FormControlLabel,
   LinearProgress,
   Paper,
   Stack,
@@ -21,8 +22,10 @@ import {
   TableHead,
   TableRow,
   Tabs,
+  TextField,
   Tooltip,
   Typography,
+  Switch,
 } from '@mui/material';
 import { createDockerDesktopClient } from '@docker/extension-api-client';
 
@@ -79,6 +82,12 @@ function sumReclaimable(summary: UsageEntry[] | undefined): number {
 const DONUT_RECLAIM_COLOR = '#ed6c02';
 const DONUT_COMPACT_COLOR = '#2e7d32';
 const DONUT_USED_COLOR = '#cfd8dc';
+const COMPACT_NOTIFY_ENABLED_KEY = 'dsm.compactNotifyEnabled';
+const COMPACT_NOTIFY_THRESHOLD_GB_KEY = 'dsm.compactNotifyThresholdGb';
+const COMPACT_NOTIFY_LAST_AT_KEY = 'dsm.compactNotifyLastAt';
+const COMPACT_NOTIFY_LAST_SESSION_KEY = 'dsm.compactNotifyLastSession';
+const DEFAULT_COMPACT_NOTIFY_THRESHOLD_GB = 20;
+const ONE_DAY_MS = 24 * 60 * 60 * 1000;
 
 function compositeDonutGradient(
   totalBytes: number,
@@ -181,6 +190,16 @@ export function App() {
   const [confirming, setConfirming] = React.useState(false);
   const [lastResult, setLastResult] = React.useState<string | null>(null);
   const [lastCompactSummary, setLastCompactSummary] = React.useState<CompactSummary | null>(null);
+  const [compactNotifyEnabled, setCompactNotifyEnabled] = React.useState(() => localStorage.getItem(COMPACT_NOTIFY_ENABLED_KEY) === 'true');
+  const [compactNotifyThresholdGb, setCompactNotifyThresholdGb] = React.useState(() => {
+    const saved = Number(localStorage.getItem(COMPACT_NOTIFY_THRESHOLD_GB_KEY));
+    return Number.isFinite(saved) && saved > 0 ? saved : DEFAULT_COMPACT_NOTIFY_THRESHOLD_GB;
+  });
+  const [notificationPermission, setNotificationPermission] = React.useState(() => (typeof Notification === 'undefined' ? 'unsupported' : Notification.permission));
+  const [compactNotifyThresholdEditing, setCompactNotifyThresholdEditing] = React.useState(false);
+  const [sessionStartedAt, setSessionStartedAt] = React.useState<string | null>(null);
+  const [nowTick, setNowTick] = React.useState(() => Date.now());
+  const compactNotificationsRef = React.useRef<Notification[]>([]);
 
   const refreshUsage = React.useCallback(async () => {
     setUsageLoading(true);
@@ -227,6 +246,61 @@ export function App() {
   React.useEffect(() => {
     void Promise.all([refreshPlatform(), refreshHostStatus(), refreshUsage(), refreshContainers()]);
   }, [refreshPlatform, refreshHostStatus, refreshUsage, refreshContainers]);
+
+  React.useEffect(() => {
+    (async () => {
+      try {
+        const r = (await dd.extension.vm?.service?.get('/session')) as { startedAt?: string };
+        if (r?.startedAt) setSessionStartedAt(r.startedAt);
+      } catch {
+        // Backend may not yet expose /session on older builds; fall back to leaving null.
+      }
+    })();
+  }, [dd]);
+
+  // Re-evaluate the notification gate hourly so a Docker Desktop session that
+  // stays open for many days still fires once a day without a tab reopen.
+  React.useEffect(() => {
+    const id = window.setInterval(() => setNowTick(Date.now()), 60 * 60 * 1000);
+    return () => window.clearInterval(id);
+  }, []);
+
+  React.useEffect(() => {
+    localStorage.setItem(COMPACT_NOTIFY_ENABLED_KEY, compactNotifyEnabled ? 'true' : 'false');
+  }, [compactNotifyEnabled]);
+
+  React.useEffect(() => {
+    localStorage.setItem(COMPACT_NOTIFY_THRESHOLD_GB_KEY, String(compactNotifyThresholdGb));
+  }, [compactNotifyThresholdGb]);
+
+  React.useEffect(() => {
+    if (!compactNotifyThresholdEditing) return;
+    const timeout = window.setTimeout(() => setCompactNotifyThresholdEditing(false), 1200);
+    return () => window.clearTimeout(timeout);
+  }, [compactNotifyThresholdEditing, compactNotifyThresholdGb]);
+
+  const openExtensionFromNotification = () => {
+    window.focus();
+    setTab(0);
+  };
+
+  const enableCompactNotifications = async (checked: boolean) => {
+    if (!checked) {
+      setCompactNotifyEnabled(false);
+      return;
+    }
+    if (typeof Notification !== 'undefined' && Notification.permission === 'default') {
+      const permission = await Notification.requestPermission();
+      setNotificationPermission(permission);
+      setCompactNotifyEnabled(permission === 'granted');
+      if (permission !== 'granted') {
+        dd.desktopUI?.toast?.warning?.('Notifications were not enabled. Allow notifications to get compact reminders.');
+      }
+      return;
+    }
+    if (typeof Notification !== 'undefined') setNotificationPermission(Notification.permission);
+    setCompactNotifyEnabled(true);
+  };
 
   const loadHotspots = async (id: string) => {
     setSelectedContainer(id);
@@ -351,6 +425,37 @@ export function App() {
   const reclaimableBytes = sumReclaimable(usage?.summary);
   const reclaimEstimateUnavailable = Boolean(usage?.warning || (usage && usage.summary.length === 0));
   const compactable = compactableEstimate(vhdx);
+  const compactNotifyThresholdBytes = compactNotifyThresholdGb * 1024 ** 3;
+
+  React.useEffect(() => {
+    if (compactNotifyThresholdEditing) return;
+    if (!compactNotifyEnabled || compactNotifyThresholdBytes <= 0) return;
+    if (compactable.bytes < compactNotifyThresholdBytes) return;
+    if (!sessionStartedAt) return;
+
+    const lastAt = Number(localStorage.getItem(COMPACT_NOTIFY_LAST_AT_KEY)) || 0;
+    const lastSession = localStorage.getItem(COMPACT_NOTIFY_LAST_SESSION_KEY) ?? '';
+    const sessionChanged = lastSession !== sessionStartedAt;
+    const dayElapsed = Date.now() - lastAt > ONE_DAY_MS;
+    if (!sessionChanged && !dayElapsed) return;
+
+    const message = `${fmtBytes(compactable.bytes)} can likely be reclaimed. Open Docker Desktop → Extensions → Docker Space Manager and click Compact.`;
+    if (typeof Notification !== 'undefined' && Notification.permission === 'granted') {
+      const notification = new Notification('Docker Space Manager', { body: message });
+      compactNotificationsRef.current.push(notification);
+      notification.onclick = () => {
+        openExtensionFromNotification();
+        notification.close();
+      };
+      notification.onclose = () => {
+        compactNotificationsRef.current = compactNotificationsRef.current.filter((n) => n !== notification);
+      };
+    } else {
+      dd.desktopUI?.toast?.warning?.(message);
+    }
+    localStorage.setItem(COMPACT_NOTIFY_LAST_AT_KEY, String(Date.now()));
+    localStorage.setItem(COMPACT_NOTIFY_LAST_SESSION_KEY, sessionStartedAt);
+  }, [compactNotifyThresholdEditing, compactNotifyEnabled, compactNotifyThresholdBytes, compactable.bytes, sessionStartedAt, nowTick, dd]);
 
   return (
     <Box sx={{ py: 1 }}>
@@ -453,6 +558,36 @@ export function App() {
                     </Box>
                   </Tooltip>
                 </Stack>
+
+                <Paper variant="outlined" sx={{ p: 1.5, mb: 2, bgcolor: 'rgba(46,125,50,0.04)', borderColor: 'rgba(46,125,50,0.22)' }}>
+                  <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1.5} alignItems={{ xs: 'flex-start', sm: 'center' }} justifyContent="space-between">
+                    <FormControlLabel
+                      control={<Switch color="success" checked={compactNotifyEnabled} onChange={(_, checked) => void enableCompactNotifications(checked)} />}
+                      label="Notify me when compactable space is high"
+                    />
+                    <TextField
+                      size="small"
+                      type="number"
+                      label="Threshold"
+                      value={compactNotifyThresholdGb}
+                      onChange={(e) => {
+                        setCompactNotifyThresholdEditing(true);
+                        const next = Number(e.target.value);
+                        if (Number.isFinite(next) && next > 0) setCompactNotifyThresholdGb(next);
+                      }}
+                      onFocus={() => setCompactNotifyThresholdEditing(true)}
+                      onBlur={() => setCompactNotifyThresholdEditing(false)}
+                      disabled={!compactNotifyEnabled}
+                      inputProps={{ min: 1, step: 1 }}
+                      InputProps={{ endAdornment: <Typography variant="caption" color="text.secondary">GB</Typography> }}
+                      sx={{ width: 150 }}
+                    />
+                  </Stack>
+                  <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mt: 0.75 }}>
+                    Notifies you once per Docker Desktop session (and at most once a day) when the compactable estimate reaches {fmtBytes(compactNotifyThresholdBytes)}.
+                    {notificationPermission === 'denied' ? ' Browser notifications are blocked, so Docker Desktop toasts will be used instead.' : ''}
+                  </Typography>
+                </Paper>
 
                 <Stack spacing={1.25}>
                   <Stack direction="row" spacing={1} alignItems="center" flexWrap="wrap" rowGap={0.75}>

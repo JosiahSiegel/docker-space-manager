@@ -24,6 +24,8 @@ var logger = logrus.New()
 var operationLock sync.Mutex
 var operationActive bool
 
+var sessionStartedAt = time.Now().UTC()
+
 func main() {
 	var socketPath string
 	flag.StringVar(&socketPath, "socket", "/run/guest-services/backend.sock", "Unix domain socket to listen on")
@@ -55,6 +57,7 @@ func main() {
 	router.Listener = ln
 
 	router.GET("/health", health)
+	router.GET("/session", getSession)
 	router.GET("/platform", getPlatform)
 	router.GET("/usage", getUsage)
 	router.GET("/containers", listContainers)
@@ -71,6 +74,13 @@ func listen(path string) (net.Listener, error) {
 
 func health(ctx echo.Context) error {
 	return ctx.JSON(http.StatusOK, map[string]string{"status": "ok"})
+}
+
+// getSession returns when this backend process started. The extension VM
+// container restarts with Docker Desktop, so this approximates Docker
+// Desktop's own session start — used by the UI to throttle daily notifications.
+func getSession(ctx echo.Context) error {
+	return ctx.JSON(http.StatusOK, map[string]string{"startedAt": sessionStartedAt.Format(time.RFC3339Nano)})
 }
 
 type PlatformInfo struct {
